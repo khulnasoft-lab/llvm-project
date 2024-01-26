@@ -116,7 +116,7 @@ void openbsd::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   const bool Shared = Args.hasArg(options::OPT_shared);
   const bool Profiling = Args.hasArg(options::OPT_pg);
   const bool Pie = Args.hasArg(options::OPT_pie);
-  const bool Nopie = Args.hasArg(options::OPT_nopie);
+  const bool Nopie = Args.hasArg(options::OPT_no_pie, options::OPT_nopie);
   const bool Relocatable = Args.hasArg(options::OPT_r);
   ArgStringList CmdArgs;
 
@@ -371,7 +371,7 @@ std::string OpenBSD::getCompilerRT(const ArgList &Args, StringRef Component,
   if (Component == "builtins") {
     SmallString<128> Path(getDriver().SysRoot);
     llvm::sys::path::append(Path, "/usr/lib/libcompiler_rt.a");
-    return std::string(Path.str());
+    return std::string(Path);
   }
   SmallString<128> P(getDriver().ResourceDir);
   std::string CRTBasename =
@@ -379,7 +379,7 @@ std::string OpenBSD::getCompilerRT(const ArgList &Args, StringRef Component,
   llvm::sys::path::append(P, "lib", CRTBasename);
   // Checks if this is the base system case which uses a different location.
   if (getVFS().exists(P))
-    return std::string(P.str());
+    return std::string(P);
   return ToolChain::getCompilerRT(Args, Component, Type);
 }
 

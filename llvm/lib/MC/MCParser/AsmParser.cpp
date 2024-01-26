@@ -1950,7 +1950,7 @@ bool AsmParser::parseStatement(ParseStatementInfo &Info,
       Lex();
     }
 
-    if (CFIStartProcLoc && Sym->isExternal())
+    if (MAI.hasSubsectionsViaSymbols() && CFIStartProcLoc && Sym->isExternal())
       return Error(StartTokLoc, "non-private labels cannot appear between "
                                 ".cfi_startproc / .cfi_endproc pairs") &&
              Error(*CFIStartProcLoc, "previous .cfi_startproc was here");
@@ -1991,7 +1991,7 @@ bool AsmParser::parseStatement(ParseStatementInfo &Info,
   // Otherwise, we have a normal instruction or directive.
 
   // Directives start with "."
-  if (IDVal.startswith(".") && IDVal != ".") {
+  if (IDVal.starts_with(".") && IDVal != ".") {
     // There are several entities interested in parsing directives:
     //
     // 1. The target-specific assembly parser. Some directives are target

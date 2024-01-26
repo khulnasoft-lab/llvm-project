@@ -184,6 +184,7 @@ void AArch64Subtarget::initializeProperties(bool HasMinSize) {
   case AppleA14:
   case AppleA15:
   case AppleA16:
+  case AppleA17:
     CacheLineSize = 64;
     PrefetchDistance = 280;
     MinPrefetchStride = 2048;
@@ -192,6 +193,7 @@ void AArch64Subtarget::initializeProperties(bool HasMinSize) {
     case AppleA14:
     case AppleA15:
     case AppleA16:
+    case AppleA17:
       MaxInterleaveFactor = 4;
       break;
     default:
@@ -396,8 +398,6 @@ AArch64Subtarget::ClassifyGlobalReference(const GlobalValue *GV,
 
   if (!TM.shouldAssumeDSOLocal(*GV->getParent(), GV)) {
     if (GV->hasDLLImportStorageClass()) {
-      if (isWindowsArm64EC() && GV->getValueType()->isFunctionTy())
-        return AArch64II::MO_GOT | AArch64II::MO_DLLIMPORTAUX;
       return AArch64II::MO_GOT | AArch64II::MO_DLLIMPORT;
     }
     if (getTargetTriple().isOSWindows())
@@ -437,11 +437,18 @@ unsigned AArch64Subtarget::classifyGlobalFunctionReference(
     return AArch64II::MO_GOT;
 
   if (getTargetTriple().isOSWindows()) {
-    if (isWindowsArm64EC() && GV->getValueType()->isFunctionTy() &&
-        GV->hasDLLImportStorageClass()) {
-      // On Arm64EC, if we're calling a function directly, use MO_DLLIMPORT,
-      // not MO_DLLIMPORTAUX.
-      return AArch64II::MO_GOT | AArch64II::MO_DLLIMPORT;
+    if (isWindowsArm64EC() && GV->getValueType()->isFunctionTy()) {
+      if (GV->hasDLLImportStorageClass()) {
+        // On Arm64EC, if we're calling a symbol from the import table
+        // directly, use MO_ARM64EC_CALLMANGLE.
+        return AArch64II::MO_GOT | AArch64II::MO_DLLIMPORT |
+               AArch64II::MO_ARM64EC_CALLMANGLE;
+      }
+      if (GV->hasExternalLinkage()) {
+        // If we're calling a symbol directly, use the mangled form in the
+        // call instruction.
+        return AArch64II::MO_ARM64EC_CALLMANGLE;
+      }
     }
 
     // Use ClassifyGlobalReference for setting MO_DLLIMPORT/MO_COFFSTUB.
@@ -502,13 +509,13 @@ bool AArch64Subtarget::isStreamingCompatible() const {
 }
 
 bool AArch64Subtarget::isNeonAvailable() const {
-  return hasNEON() && !isStreaming() && !isStreamingCompatible();
+  return hasNEON() &&
+         (hasSMEFA64() || (!isStreaming() && !isStreamingCompatible()));
 }
 
-bool AArch64Subtarget::isSVEAvailable() const{
-  // FIXME: Also return false if FEAT_FA64 is set, but we can't do this yet
-  // as we don't yet support the feature in LLVM.
-  return hasSVE() && !isStreaming() && !isStreamingCompatible();
+bool AArch64Subtarget::isSVEAvailable() const {
+  return hasSVE() &&
+         (hasSMEFA64() || (!isStreaming() && !isStreamingCompatible()));
 }
 
 // If return address signing is enabled, tail calls are emitted as follows:

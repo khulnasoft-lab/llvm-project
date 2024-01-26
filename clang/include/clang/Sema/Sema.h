@@ -14,6 +14,7 @@
 #ifndef LLVM_CLANG_SEMA_SEMA_H
 #define LLVM_CLANG_SEMA_SEMA_H
 
+#include "clang/APINotes/APINotesManager.h"
 #include "clang/AST/ASTConcept.h"
 #include "clang/AST/ASTFwd.h"
 #include "clang/AST/Attr.h"
@@ -408,6 +409,7 @@ public:
   ASTConsumer &Consumer;
   DiagnosticsEngine &Diags;
   SourceManager &SourceMgr;
+  api_notes::APINotesManager APINotes;
 
   /// Flag indicating whether or not to collect detailed statistics.
   bool CollectStats;
@@ -952,6 +954,10 @@ public:
     LateTemplateParserCleanup = LTPCleanup;
     OpaqueParser = P;
   }
+
+  /// Callback to the parser to parse a type expressed as a string.
+  std::function<TypeResult(StringRef, StringRef, SourceLocation)>
+      ParseTypeFromStringCallback;
 
   class DelayedDiagnostics;
 
@@ -2099,9 +2105,16 @@ public:
   QualType BuildAddressSpaceAttr(QualType &T, Expr *AddrSpace,
                                  SourceLocation AttrLoc);
 
+  CodeAlignAttr *BuildCodeAlignAttr(const AttributeCommonInfo &CI, Expr *E);
+  bool CheckRebuiltStmtAttributes(ArrayRef<const Attr *> Attrs);
+
   bool CheckQualifiedFunctionForTypeId(QualType T, SourceLocation Loc);
 
   bool CheckFunctionReturnType(QualType T, SourceLocation Loc);
+
+  /// Check an argument list for placeholders that we won't try to
+  /// handle later.
+  bool CheckArgsForPlaceholders(MultiExprArg args);
 
   /// Build a function type.
   ///
@@ -2148,7 +2161,7 @@ public:
                          SourceLocation Loc);
   QualType BuildBitIntType(bool IsUnsigned, Expr *BitWidth, SourceLocation Loc);
 
-  TypeSourceInfo *GetTypeForDeclarator(Declarator &D, Scope *S);
+  TypeSourceInfo *GetTypeForDeclarator(Declarator &D);
   TypeSourceInfo *GetTypeForDeclaratorCast(Declarator &D, QualType FromTy);
 
   /// Package the given type and TSI into a ParsedType.
@@ -2189,7 +2202,7 @@ public:
       SourceLocation TargetLoc, const FunctionProtoType *Source,
       bool SkipSourceFirstParameter, SourceLocation SourceLoc);
 
-  TypeResult ActOnTypeName(Scope *S, Declarator &D);
+  TypeResult ActOnTypeName(Declarator &D);
 
   /// The parser has parsed the context-sensitive type 'instancetype'
   /// in an Objective-C message declaration. Return the appropriate type.
@@ -3012,6 +3025,9 @@ public:
   ParmVarDecl *BuildParmVarDeclForTypedef(DeclContext *DC,
                                           SourceLocation Loc,
                                           QualType T);
+  QualType AdjustParameterTypeForObjCAutoRefCount(QualType T,
+                                                  SourceLocation NameLoc,
+                                                  TypeSourceInfo *TSInfo);
   ParmVarDecl *CheckParameter(DeclContext *DC, SourceLocation StartLoc,
                               SourceLocation NameLoc, IdentifierInfo *Name,
                               QualType T, TypeSourceInfo *TSInfo,
@@ -3732,6 +3748,9 @@ public:
                                               int X, int Y, int Z);
   HLSLShaderAttr *mergeHLSLShaderAttr(Decl *D, const AttributeCommonInfo &AL,
                                       HLSLShaderAttr::ShaderType ShaderType);
+  HLSLParamModifierAttr *
+  mergeHLSLParamModifierAttr(Decl *D, const AttributeCommonInfo &AL,
+                             HLSLParamModifierAttr::Spelling Spelling);
 
   void mergeDeclAttributes(NamedDecl *New, Decl *Old,
                            AvailabilityMergeKind AMK = AMK_Redeclaration);
@@ -3844,6 +3863,12 @@ public:
                                   const FunctionProtoType *NewType,
                                   unsigned *ArgPos = nullptr,
                                   bool Reversed = false);
+
+  bool FunctionNonObjectParamTypesAreEqual(const FunctionDecl *OldFunction,
+                                           const FunctionDecl *NewFunction,
+                                           unsigned *ArgPos = nullptr,
+                                           bool Reversed = false);
+
   void HandleFunctionTypeMismatch(PartialDiagnostic &PDiag,
                                   QualType FromType, QualType ToType);
 
@@ -3917,6 +3942,11 @@ public:
   ExprResult CheckConvertedConstantExpression(Expr *From, QualType T,
                                               APValue &Value, CCEKind CCE,
                                               NamedDecl *Dest = nullptr);
+
+  ExprResult
+  EvaluateConvertedConstantExpression(Expr *E, QualType T, APValue &Value,
+                                      CCEKind CCE, bool RequireInt,
+                                      const APValue &PreNarrowingValue);
 
   /// Abstract base class used to perform a contextual implicit
   /// conversion from an expression to any type passing a filter.
@@ -4796,6 +4826,29 @@ public:
   /// Get the outermost AttributedType node that sets a calling convention.
   /// Valid types should not have multiple attributes with different CCs.
   const AttributedType *getCallingConvAttributedType(QualType T) const;
+
+  /// Check whether a nullability type specifier can be added to the given
+  /// type through some means not written in source (e.g. API notes).
+  ///
+  /// \param Type The type to which the nullability specifier will be
+  /// added. On success, this type will be updated appropriately.
+  ///
+  /// \param Nullability The nullability specifier to add.
+  ///
+  /// \param DiagLoc The location to use for diagnostics.
+  ///
+  /// \param AllowArrayTypes Whether to accept nullability specifiers on an
+  /// array type (e.g., because it will decay to a pointer).
+  ///
+  /// \param OverrideExisting Whether to override an existing, locally-specified
+  /// nullability specifier rather than complaining about the conflict.
+  ///
+  /// \returns true if nullability cannot be applied, false otherwise.
+  bool CheckImplicitNullabilityTypeSpecifier(QualType &Type,
+                                             NullabilityKind Nullability,
+                                             SourceLocation DiagLoc,
+                                             bool AllowArrayTypes,
+                                             bool OverrideExisting);
 
   /// Process the attributes before creating an attributed statement. Returns
   /// the semantic attributes that have been processed.
@@ -7091,15 +7144,7 @@ public:
                                  NestedNameSpecInfo &IdInfo,
                                  bool EnteringContext);
 
-  /// The kind of conversion to check for. Either all attributes must match exactly,
-  /// or the converted type may add/drop '__arm_preserves_za'.
-  enum class AArch64SMECallConversionKind {
-    MatchExactly,
-    MayAddPreservesZA,
-    MayDropPreservesZA,
-  };
-  bool IsInvalidSMECallConversion(QualType FromType, QualType ToType,
-                                  AArch64SMECallConversionKind C);
+  bool IsInvalidSMECallConversion(QualType FromType, QualType ToType);
 
   /// The parser has parsed a nested-name-specifier
   /// 'template[opt] template-name < template-args >::'.
@@ -7292,8 +7337,7 @@ public:
 
   /// ActOnLambdaExpr - This is called when the body of a lambda expression
   /// was successfully completed.
-  ExprResult ActOnLambdaExpr(SourceLocation StartLoc, Stmt *Body,
-                             Scope *CurScope);
+  ExprResult ActOnLambdaExpr(SourceLocation StartLoc, Stmt *Body);
 
   /// Does copying/destroying the captured variable have side effects?
   bool CaptureHasSideEffects(const sema::Capture &From);
@@ -8542,13 +8586,17 @@ public:
                                      TemplateParameterList *Params,
                                      TemplateArgumentLoc &Arg);
 
+  void NoteTemplateLocation(const NamedDecl &Decl,
+                            std::optional<SourceRange> ParamRange = {});
+  void NoteTemplateParameterLocation(const NamedDecl &Decl);
+
   ExprResult
   BuildExpressionFromDeclTemplateArgument(const TemplateArgument &Arg,
                                           QualType ParamType,
                                           SourceLocation Loc);
   ExprResult
-  BuildExpressionFromIntegralTemplateArgument(const TemplateArgument &Arg,
-                                              SourceLocation Loc);
+  BuildExpressionFromNonTypeTemplateArgument(const TemplateArgument &Arg,
+                                             SourceLocation Loc);
 
   /// Enumeration describing how template parameter lists are compared
   /// for equality.
@@ -9335,8 +9383,7 @@ public:
 
   QualType DeduceTemplateSpecializationFromInitializer(
       TypeSourceInfo *TInfo, const InitializedEntity &Entity,
-      const InitializationKind &Kind, MultiExprArg Init,
-      ParenListExpr *PL = nullptr);
+      const InitializationKind &Kind, MultiExprArg Init);
 
   QualType deduceVarTypeFromInitializer(VarDecl *VDecl, DeclarationName Name,
                                         QualType Type, TypeSourceInfo *TSI,
@@ -10245,11 +10292,13 @@ public:
     ~ConstraintEvalRAII() { TI.setEvaluateConstraints(OldValue); }
   };
 
-  // Unlike the above, this evaluates constraints, which should only happen at
-  // 'constraint checking' time.
+  // Must be used instead of SubstExpr at 'constraint checking' time.
   ExprResult
   SubstConstraintExpr(Expr *E,
                       const MultiLevelTemplateArgumentList &TemplateArgs);
+  // Unlike the above, this does not evaluates constraints.
+  ExprResult SubstConstraintExprWithoutSatisfaction(
+      Expr *E, const MultiLevelTemplateArgumentList &TemplateArgs);
 
   /// Substitute the given template arguments into a list of
   /// expressions, expanding pack expansions if required.
@@ -10991,11 +11040,19 @@ public:
 
   /// Called on well formed
   /// \#pragma clang fp reassociate
-  void ActOnPragmaFPReassociate(SourceLocation Loc, bool IsEnabled);
+  /// or
+  /// \#pragma clang fp reciprocal
+  void ActOnPragmaFPValueChangingOption(SourceLocation Loc, PragmaFPKind Kind,
+                                        bool IsEnabled);
 
   /// ActOnPragmaFenvAccess - Called on well formed
   /// \#pragma STDC FENV_ACCESS
   void ActOnPragmaFEnvAccess(SourceLocation Loc, bool IsEnabled);
+
+  /// ActOnPragmaCXLimitedRange - Called on well formed
+  /// \#pragma STDC CX_LIMITED_RANGE
+  void ActOnPragmaCXLimitedRange(SourceLocation Loc,
+                                 LangOptions::ComplexRangeKind Range);
 
   /// Called on well formed '\#pragma clang fp' that has option 'exceptions'.
   void ActOnPragmaFPExceptions(SourceLocation Loc,
@@ -11192,6 +11249,11 @@ public:
   VarDecl *buildCoroutinePromise(SourceLocation Loc);
   void CheckCompletedCoroutineBody(FunctionDecl *FD, Stmt *&Body);
 
+  // Heuristically tells if the function is `get_return_object` member of a
+  // coroutine promise_type by matching the function name.
+  static bool CanBeGetReturnObject(const FunctionDecl *FD);
+  static bool CanBeGetReturnTypeOnAllocFailure(const FunctionDecl *FD);
+
   // As a clang extension, enforces that a non-coroutine function must be marked
   // with [[clang::coro_wrapper]] if it returns a type marked with
   // [[clang::coro_return_type]].
@@ -11318,9 +11380,12 @@ private:
   /// rigorous semantic checking in the new mapped directives.
   bool mapLoopConstruct(llvm::SmallVector<OMPClause *> &ClausesWithoutBind,
                         ArrayRef<OMPClause *> Clauses,
-                        OpenMPBindClauseKind BindKind,
+                        OpenMPBindClauseKind &BindKind,
                         OpenMPDirectiveKind &Kind,
-                        OpenMPDirectiveKind &PrevMappedDirective);
+                        OpenMPDirectiveKind &PrevMappedDirective,
+                        SourceLocation StartLoc, SourceLocation EndLoc,
+                        const DeclarationNameInfo &DirName,
+                        OpenMPDirectiveKind CancelRegion);
 
 public:
   /// The declarator \p D defines a function in the scope \p S which is nested
@@ -12193,6 +12258,13 @@ public:
   /// Called on well-formed 'compare' clause.
   OMPClause *ActOnOpenMPCompareClause(SourceLocation StartLoc,
                                       SourceLocation EndLoc);
+  /// Called on well-formed 'fail' clause.
+  OMPClause *ActOnOpenMPFailClause(SourceLocation StartLoc,
+                                   SourceLocation EndLoc);
+  OMPClause *ActOnOpenMPFailClause(
+      OpenMPClauseKind Kind, SourceLocation KindLoc,
+      SourceLocation StartLoc, SourceLocation LParenLoc, SourceLocation EndLoc);
+
   /// Called on well-formed 'seq_cst' clause.
   OMPClause *ActOnOpenMPSeqCstClause(SourceLocation StartLoc,
                                      SourceLocation EndLoc);
@@ -12934,7 +13006,7 @@ public:
   QualType FindCompositeObjCPointerType(ExprResult &LHS, ExprResult &RHS,
                                         SourceLocation QuestionLoc);
 
-  bool DiagnoseConditionalForNull(Expr *LHSExpr, Expr *RHSExpr,
+  bool DiagnoseConditionalForNull(const Expr *LHSExpr, const Expr *RHSExpr,
                                   SourceLocation QuestionLoc);
 
   void DiagnoseAlwaysNonNullPointer(Expr *E,
@@ -13461,10 +13533,6 @@ public:
   void maybeAddCUDAHostDeviceAttrs(FunctionDecl *FD,
                                    const LookupResult &Previous);
 
-  /// May add implicit CUDAHostAttr and CUDADeviceAttr attributes to a
-  /// trivial cotr/dtor that does not have host and device attributes.
-  void maybeAddCUDAHostDeviceAttrsToTrivialCtorDtor(FunctionDecl *FD);
-
   /// May add implicit CUDAConstantAttr attribute to VD, depending on VD
   /// and current compilation settings.
   void MaybeAddCUDAConstantAttr(VarDecl *VD);
@@ -13816,6 +13884,9 @@ private:
                                     CallExpr *TheCall);
   bool CheckMVEBuiltinFunctionCall(unsigned BuiltinID, CallExpr *TheCall);
   bool CheckSVEBuiltinFunctionCall(unsigned BuiltinID, CallExpr *TheCall);
+  bool ParseSVEImmChecks(CallExpr *TheCall,
+                         SmallVector<std::tuple<int, int, int>, 3> &ImmChecks);
+  bool CheckSMEBuiltinFunctionCall(unsigned BuiltinID, CallExpr *TheCall);
   bool CheckCDEBuiltinFunctionCall(const TargetInfo &TI, unsigned BuiltinID,
                                    CallExpr *TheCall);
   bool CheckARMCoprocessorImmediate(const TargetInfo &TI, const Expr *CoprocArg,
@@ -13861,8 +13932,9 @@ private:
 
   bool SemaBuiltinVAStart(unsigned BuiltinID, CallExpr *TheCall);
   bool SemaBuiltinVAStartARMMicrosoft(CallExpr *Call);
-  bool SemaBuiltinUnorderedCompare(CallExpr *TheCall);
-  bool SemaBuiltinFPClassification(CallExpr *TheCall, unsigned NumArgs);
+  bool SemaBuiltinUnorderedCompare(CallExpr *TheCall, unsigned BuiltinID);
+  bool SemaBuiltinFPClassification(CallExpr *TheCall, unsigned NumArgs,
+                                   unsigned BuiltinID);
   bool SemaBuiltinComplex(CallExpr *TheCall);
   bool SemaBuiltinVSX(CallExpr *TheCall);
   bool SemaBuiltinOSLogFormat(CallExpr *TheCall);
@@ -13965,6 +14037,8 @@ private:
                             VariadicCallType CallType, SourceLocation Loc,
                             SourceRange range,
                             llvm::SmallBitVector &CheckedVarArgs);
+
+  void CheckInfNaNFunction(const CallExpr *Call, const FunctionDecl *FDecl);
 
   void CheckAbsoluteValueFunction(const CallExpr *Call,
                                   const FunctionDecl *FDecl);
