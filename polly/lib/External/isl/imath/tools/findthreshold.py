@@ -51,7 +51,7 @@ def get_timing_stats(num_tests, precision, threshold, seed=None):
 
 def check_binary(name):
     if not os.path.exists(name):
-        os.system('make %s' % name)
+        subprocess.run('make %s' % name, shell=False, check=True, text=True)
         if not os.path.exists(name):
             raise ValueError("Unable to build %s" % name)
     elif not os.path.isfile(name):
