@@ -1003,7 +1003,7 @@ class DotDumpVisitor:
             elif sys.platform == "darwin":
                 os.system('open "%s"' % filename)
             else:
-                os.system('xdg-open "%s"' % filename)
+                subprocess.run('xdg-open "%s"' % filename, shell=False, check=True, text=True)
 
 
 # ===-----------------------------------------------------------------------===#
